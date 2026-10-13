@@ -1,0 +1,18 @@
+# Git ignore rules for XeStrataLab
+
+# WSL仮想ディスク・インスタンス配置用フォルダ
+distro/
+*.vhdx
+*.tar
+
+# 一時作業ファイル・ダウンロード物
+temp/
+*.deb
+*.log
+.cache/
+
+# OS / エディタ固有
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
