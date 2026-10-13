@@ -30,21 +30,68 @@ XeStrataは、MoE（Mixture of Experts）アーキテクチャの大規模言語
 
 ---
 
-## 2. WSL2環境特有の技術情報と本スクリプトの対応内容
+## 2. WSL2環境特有の課題と適用したパッチの詳細
 
-XeStrataはベアメタル（物理マシン直接インストール）のLinuxを主対象として開発されており、初期状態ではWSL2上でそのまま動作しない要因がいくつか存在します。本プロジェクトではこれらに対して以下の対応を行っています。
+XeStrataはベアメタル（物理マシン直接インストール）のLinux環境を想定して設計されているため、WSL2およびWSLコンテナ環境では以下の3つの課題が生じます。本リポジトリではこれらを自動検出・修正するパッチを [internal-setup.sh](./internal-setup.sh) 内で自動適用しています。
 
-### (1) GPU検出処理のフォールバック (`/sys/class/drm` の不在)
-- **要因**: 物理Linux環境では `/sys/class/drm/card*` を走査してPCIデバイスを認識しますが、WSL2ではGPUがDirectX仮想化ブリッジ（`/dev/dxg`）経由で接続されるため、このsysfsノードが存在しません。その結果、初期のハードウェア検査で「GPUなし」と判定されます。
-- **対応**: [internal-setup.sh](./internal-setup.sh) 内でセットアップスクリプト（`setup.py`）にパッチを適用し、`/sys/class/drm` が存在しない場合は `nvidia-smi` の出力からGPU情報（VRAM容量、Compute Capability等）を取得し、レンダーノードとして `/dev/dxg` を参照するよう修正しています。
+### (1) GPU検出の失敗 (`/sys/class/drm` の不在)
+- **問題の現象**:  
+  `xestrata --check` や `xestrata --setup` 実行時に `[X] no NVIDIA GPU on NVIDIA's driver found` と出力されて停止する。
+- **原因の技術的背景**:  
+  XeStrataのハードウェア検出処理（`/usr/share/xestrata/setup.py` の `gpus()` 関数）は、Linux物理PCIデバイスのsysfsノード（`/sys/class/drm/card*`）を走査してGPUを特定します。  
+  しかしWSL2環境では、GPUは物理PCIバス直結ではなくMicrosoftのDirectX仮想化ドライバ（`dxgkrnl` / `/dev/dxg`）経由でパススルーされるため、`/sys/class/drm` が存在しません。その結果、コンテナ内で `nvidia-smi` やCUDAドライバが正常に動いていても検出から漏れてしまいます。
+- **適用したパッチ（差分）**:  
+  sysfs走査で見つからなかった場合、`nvidia_smi()` を呼び出してGPU名・VRAM容量・Compute Capabilityを取得し、レンダーノードを `/dev/dxg` に紐付けるフォールバックを追加しました。
 
-### (2) 推論エンジン（SYCL/Unified Runtime）とメモリ配置 (`--mmap-experts`)
-- **要因**: XeStrataの内部エンジンはIntelのSYCLコンパイラ（`intel/llvm`）およびUnified Runtime（UR）のCUDAアダプター経由でGPU処理を行います。モデル全量をRAM上に一度にコピーしようとすると、WSL2のメモリ割り当て境界で `CUDA_ERROR_ILLEGAL_ADDRESS (エラー700)` が発生する場合があります。
-- **対応**: NVIDIA公式の `libcublas-13-1` を導入した上で、Low-RAMモード（`--mmap-experts`）を適用します。これにより、頻繁に参照されるExpertのみをVRAM（約7〜9GB）に配置し、残りはファイルキャッシュ経由で読み込むため、限られたRAM容量でも安定して動作します。
+```python
+# /usr/share/xestrata/setup.py の gpus() 関数へのパッチ
+if not found and not nvidia and not amd:
+    smi = nvidia_smi()
+    for pci, info in smi.items():
+        nvidia.append({
+            "name": info.get("name", "NVIDIA GPU"),
+            "vram_gb": info.get("mib", 0.0) / 1024,
+            "device_id": 0,
+            "driver": "nvidia",
+            "integrated": False,
+            "supported": True,
+            "pci": pci,
+            "bar_gb": info.get("mib", 0.0) / 1024,
+            "link": "WSL2 GPU Passthrough",
+            "render": "/dev/dxg",
+            "vendor": "nvidia",
+            "cc": info.get("cc")
+        })
+```
 
-### (3) Webサーバーのバインドアドレス (`0.0.0.0`)
-- **要因**: XeStrata付属のWebサーバーは既定で `127.0.0.1`（ループバックアドレス）でリッスンします。コンテナー運用の場合、この状態ではWindowsホスト側からの接続が遮断されます。
-- **対応**: 外部ホスト接続用として `host: "0.0.0.0"` にバインドする設定を適用しています。
+---
+
+### (2) 推論エンジンのIllegal Memory Access (`CUDA_ERROR_ILLEGAL_ADDRESS`)
+- **問題の現象**:  
+  モデル読み込み時（`reading the model's weights`）に Unified Runtime (UR) がエラー700（`CUDA_ERROR_ILLEGAL_ADDRESS`）を出力してプロセスが異常終了する。
+- **原因の技術的背景**:  
+  XeStrataの推論エンジン本体（`strata` バイナリ）は、Intel SYCLコンパイラ（`intel/llvm`）およびUnified RuntimeのCUDAアダプター経由でGPU処理を行います。  
+  ① 推奨ライブラリ `libcublas-13-1`（`libcublas.so.13`）が欠落していると独自の内製カーネルにフォールバックすること、  
+  ② 巨大なMoEモデルの重みをホストRAM上に一括確保（`experts in RAM`）しようとすると、WSL2のUVM（Unified Virtual Memory）仮想化境界でメモリアクセス違反が生じること、  
+  この2点が重なることで発生します。
+- **適用した対策**:  
+  1. `libcublas-13-1` を自動インストールし、`/etc/ld.so.conf.d/cuda-13-1.conf` にパスを通す。
+  2. モデル設定（JSON）に `--mmap-experts`（Low-RAMモード）を適用する。これにより、頻繁に使われるExpertのみをVRAMスロット（約7〜9GB）に保持し、残りはファイルキャッシュ経由で読み出す動作になり、RAMの圧迫とメモリアクセス例外が解消されます。
+
+---
+
+### (3) Web UIへの接続遮断 (ループバックバインド `127.0.0.1`)
+- **問題の現象**:  
+  コンテナ内でサーバーが起動しているにもかかわらず、Windowsホスト側のブラウザから `http://127.0.0.1:8095` を開くと接続リセット（Connection reset）となる。
+- **原因の技術的背景**:  
+  XeStrataのAPIサーバー（`/usr/share/xestrata/serve/server.py`）の既定の待ち受けIPが `127.0.0.1`（コンテナ内ローカルホスト）に固定されているため、Windowsホストから転送されてきたパケットが拒否されます。
+- **適用したパッチ**:  
+  サーバー起動設定のホストバインドアドレスのデフォルト値を `0.0.0.0` に変更し、コンテナ外からの通信を受け付けるように修正しました。
+
+```python
+# /usr/share/xestrata/serve/server.py へのパッチ
+# cfg.get("host") or "127.0.0.1" -> cfg.get("host") or "0.0.0.0"
+```
 
 ---
 
